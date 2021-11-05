@@ -1,0 +1,333 @@
+---
+title: 'Assignment #5'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(ranger)            # for random forest - will need for shiny app
+library(lubridate)         # for date manipulation
+library(themis)            # for up and downsampling
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+library(patchwork)         # for combining plots nicely
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+data("lending_club")
+```
+
+## Put it on GitHub!        
+
+[gitHub](https://github.com/yzhong0620/STAT-456-Assignment-5)
+
+## Interpretable ML methods
+
+We will once again use the lending club data that we used in the 3rd assignment. We will focus on the random forest model, which I recreate below. (Note we use this model even though the true negative rate of the training set is quite bad.)
+
+```{r}
+set.seed(494) # for reproducibility
+
+# split data
+lending_split <- initial_split(lending_club,
+                               prop = .75,
+                               strata = Class)
+
+lending_training <- training(lending_split)
+lending_test <- testing(lending_split)
+
+
+# create recipe - including up and downsampling for model fitting
+set.seed(456)
+rf_recipe <- 
+  recipe(Class ~ .,
+         data = lending_training) %>% 
+  step_upsample(Class, over_ratio = .5) %>% 
+  step_downsample(Class, under_ratio = 1) %>% 
+  step_mutate_at(all_numeric(), 
+                 fn = ~as.numeric(.))
+
+# create model
+rf_model <- 
+  rand_forest(mtry = tune(), 
+              min_n = tune(), 
+              trees = 100) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+# create workflow
+rf_workflow <-
+  workflow() %>% 
+  add_recipe(rf_recipe) %>% 
+  add_model(rf_model)
+
+  grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+
+# create penalty grid
+  rf_penalty_grid <- 
+grid_regular(finalize(mtry(),
+                        lending_training %>%
+                          select(-Class)),
+               min_n(),
+               levels = 3)
+
+
+# create cv samples
+set.seed(494) # for reproducible 5-fold
+lending_cv <- vfold_cv(lending_training,
+                       v = 5)
+
+# tune model
+rf_tune <- 
+  rf_workflow %>% 
+  tune_grid(
+    resamples = lending_cv,
+    grid = rf_penalty_grid
+  )
+
+# find model with best accuracy
+best_accuracy <-
+  rf_tune %>% 
+  select_best(metric = "accuracy")
+
+# finalize model
+rf_final <- rf_workflow %>% 
+  finalize_workflow(best_accuracy) %>% 
+  fit(data = lending_training)
+```
+
+1. Use functions from the `DALEX` and `DALEXtra` libraries to create a histogram and boxplot of the residuals from the training data. How do they look? Any interesting behavior?
+
+```{r}
+rf_explain <- 
+  explain_tidymodels(
+    model = rf_final,
+    data = lending_training %>% select(-Class), 
+    y = lending_training %>% 
+      mutate(Class_num = as.integer(Class =="good")) %>% 
+      pull(Class_num),
+    label = "rf"
+  )
+
+rf_mod_perf <-  model_performance(rf_explain)
+
+hist_plot <- 
+  plot(rf_mod_perf, 
+       geom = "histogram")
+box_plot <-
+  plot(rf_mod_perf, 
+       geom = "boxplot")
+
+hist_plot + box_plot
+```
+
+> The histogram is right-skewed, showing that although most predictions have small residuals between 0.0 and 0.2, there are outliers that have larger residuals. Similarly, as shown in the boxplot, most residuals are between 0.0 and 0.2, but residuals for outliers can go all the way up to 0.7.
+
+2. Use `DALEX` functions to create a variable importance plot from this model. What are the most important variables? 
+
+```{r}
+set.seed(10)
+rf_var_imp <- 
+  model_parts(
+    rf_explain
+    )
+
+plot(rf_var_imp, show_boxplots = TRUE)
+```
+
+> int_rate, open_il_24m, and annual_inc are the most important variables.
+
+3. Write a function called `cp_profile` to make a CP profile. The function will take an explainer, a new observation, and a variable name as its arguments and create a CP profile for a quantitative predictor variable. You will need to use the `predict_profile()` function inside the function you create - put the variable name there so the plotting part is easier. You'll also want to use `.data[[]]` rather than `aes()` and quote the variables. Use the `cp_profile()` function to create one CP profile of your choosing. Be sure to choose a variable that is numeric, not integer. There seem to be issues with those that I'm looking into.
+
+For an extra challenge, write a function that will work for either a quantitative or categorical variable. 
+
+If you need help with function writing check out the [Functions](https://r4ds.had.co.nz/functions.html) chapter of R4DS by Wickham and Grolemund.
+
+```{r}
+cp_profile <- function(explainer, new_obs, variable){
+  rf_cpp <- predict_profile(explainer = explainer,
+                            variables = variable,
+                            new_observation = new_obs) 
+  plot <- rf_cpp %>% 
+  filter(`_vname_` %in% c(variable)) %>% 
+  ggplot(aes(x = .data[[variable]],
+             y = `_yhat_`)) +
+  geom_line()
+  return(plot)
+}
+
+obs4 <- lending_training %>% slice(4)
+cp_profile(rf_explain, obs4, "int_rate")
+```
+
+4. Use `DALEX` functions to create partial dependence plots (with the CP profiles in gray) for the 3-4 most important variables. If the important variables are categorical, you can instead make a CP profile for 3 observations in the dataset and discuss how you could go about constructing a partial dependence plot for a categorical variable (you don't have to code it, but you can if you want an extra challenge). If it ever gives you an error that says, "Error: Can't convert from `VARIABLE` <double> to `VARIABLE` <integer> due to loss of precision", then remove that variable from the list. I seem to have figured out why it's doing that, but I don't know how to fix it yet.
+
+```{r}
+set.seed(494)
+
+rf_pdp1 <- model_profile(explainer = rf_explain,
+                         variables = c("int_rate"))
+
+plot(rf_pdp1, 
+     variables = "int_rate",
+     geom = "profiles")
+
+rf_pdp2 <- model_profile(explainer = rf_explain,
+                         variables = c("open_il_24m"))
+
+plot(rf_pdp2, 
+     variables = "open_il_24m",
+     geom = "profiles")
+
+rf_pdp3 <- model_profile(explainer = rf_explain,
+                         variables = c("annual_inc"))
+
+plot(rf_pdp3, 
+     variables = "annual_inc",
+     geom = "profiles")
+```
+
+5. Choose 3 observations and do the following for each observation:  
+  - Construct a break-down plot using the default ordering. Interpret the resulting graph. Which variables contribute most to each observation's prediction?  
+  - Construct a SHAP graph and interpret it. Does it tell a similar story to the break-down plot?  
+  - Construct a LIME graph (follow my code carefully). How close is each original prediction to the prediction from the local model? Interpret the result. You can also try using fewer or more variables in the local model than I used in the example.  
+
+```{r}
+obs2000 <- lending_test %>% slice(2000) 
+
+pp2000 <- predict_parts(explainer = rf_explain,
+                        new_observation = obs2000,
+                        type = "break_down")
+plot(pp2000)
+
+rf_shap2000 <-predict_parts(explainer = rf_explain,
+                            new_observation = obs2000,
+                            type = "shap",
+                            B = 10)
+
+plot(rf_shap2000)
+
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs2000 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+> **Observation 2000 break-down plot:** The intercept 0.848 is the average predicted Class when the rf model is applied to the training data. The -0.089 for the int_rate = 24.11 bar is the change in average prediction if int_rate fixed at 24.11. Similarly, sub_grade = 27 decreases Class by 0.089 and num_il_tl = 4 increases Class by 0.08. They contribute the most to observation2000's prediction. **Observation 2000 SHAP graph:** int_rate = 24.11 contributes about a 0.1 decrease to the predicted Class for this observation, on average. However, the boxplot shows a large variation across permutations of the variables’ order of consideration. That is to say, although we are confident its effect is negative, we are less confident in its exact effect. Different from the break-down plot, sub_grade = F2 and all_util = 85 are now more important than sub_grade = 27 and num_il_tl = 4. **Observation 2000 LIME graph:** The predicted value from the original random forest model is about 0.67. The Explanation fit shows that model_r2 is about 0.12. 15.31 < int_rate has the largest weight, giving an indication of it is most important in the local model and has a negative effect.
+
+```{r}
+obs6 <- lending_test %>% slice(6) 
+
+pp6 <- predict_parts(explainer = rf_explain,
+                     new_observation = obs6,
+                     type = "break_down")
+plot(pp6)
+
+rf_shap6 <-predict_parts(explainer = rf_explain,
+                         new_observation = obs6,
+                         type = "shap",
+                         B = 10)
+
+plot(rf_shap6)
+
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs6 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+> **Observation 6 break-down plot:** The intercept 0.848 is the average predicted Class when the rf model is applied to the training data. The +0.036 for the int_rate = 10.75 bar is the change in average prediction if int_rate fixed at 10.75. Similarly, sub_grade = 9 increases Class by 0.022 and open_il_6m = 3 increases Class by 0.017. They contribute the most to observation6's prediction. **Observation 6 SHAP graph:** sub_grade = B4 contributes about a 0.035 increase to the predicted Class for this observation, on average. However, the boxplot shows a large variation across permutations of the variables’ order of consideration. That is to say, although we are confident its effect is positive, we are less confident in its exact effect. Different from the break-down plot, sub_grade = B4 and inq_last_6mths = 2 are now more important than sub_grade = 9 and open_il_6m = 3. **Observation 6 LIME graph:** The predicted value from the original random forest model is about 0.87. The Explanation fit shows that model_r2 is about 0.029. open_il_12m <= 1 has the largest weight, giving an indication of it is most important in the local model and has a positive effect.
+
+```{r}
+obs20 <- lending_test %>% slice(20)
+
+pp20 <- predict_parts(explainer = rf_explain,
+                      new_observation = obs20,
+                      type = "break_down")
+plot(pp20)
+
+rf_shap20 <-predict_parts(explainer = rf_explain,
+                          new_observation = obs20,
+                          type = "shap",
+                          B = 10)
+
+plot(rf_shap20)
+
+set.seed(2)
+
+model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+
+lime_rf <- predict_surrogate(explainer = rf_explain,
+                             new_observation = obs20 %>%
+                               select(-Class), 
+                             n_features = 5,
+                             n_permutations = 1000,
+                             type = "lime")
+
+plot(lime_rf) +
+  labs(x = "Variable")
+```
+
+> **Observation 20 break-down plot:** The intercept 0.848 is the average predicted Class when the rf model is applied to the training data. The -0.038 for the inq_last_12m = 6 bar is the change in average prediction if inq_last_12m fixed at 6. Similarly, num_il_tl = 13 decreases Class by 0.037 and total_bal_il = 26275 increases Class by 0.027. They contribute the most to observation20's prediction. **Observation 20 SHAP graph:** open_il_24m = 3 contributes about a 0.045 decrease to the predicted Class for this observation, on average. However, the boxplot shows a large variation across permutations of the variables’ order of consideration. That is to say, although we are confident its effect is negative, we are less confident in its exact effect. Different from the break-down plot, open_il_24m = 3, addr_state = CA, and inq_fi are now the most important variables. **Observation 20 LIME graph:** The predicted value from the original random forest model is about 0.73. The Explanation fit shows that model_r2 is about 0.057. 11 < num_il_tl has the largest weight, giving an indication of it is most important in the local model and has a positive effect.
+  
+6. Describe how you would use the interpretable machine learning tools we've learned (both local and global) in future machine learning projects? How does each of them help you?
+
+> I would use global interpretable machine learning tools to examine the overall performance of each model. They could help me to understand how the residuals look and to find the most important variables. Local global interpretable machine learning tools could be used to find what specific values of each variable have a larger influence on the result. Then I would use this information to pay more attentaion to these special variables.
+
+7. Save this final model using the `write_rds()` function - see the [Use the model](https://advanced-ds-in-r.netlify.app/posts/2021-03-16-ml-review/#use-the-model) section of the `tidymodels` intro for a similar example, but we're using `write_rds()` instead of `saveRDS()`. We are going to use the model in the next part. You'll want to save it in the folder where you create your shiny app. Run the code, and then add `eval=FALSE` to the code chunk options (next to the r inside the curly brackets) so it doesn't rerun this each time you knit. 
+
+```{r, eval=FALSE}
+write_rds(rf_final, "rf_final.rds")
+```
+
+## Shiny app
+
+[shiny](https://yunyang-zhong.shinyapps.io/shiny_cp/)
+[post](https://yunyangzhong.netlify.app/shiny.html)
+[gitHub](https://github.com/yzhong0620/shiny_cp)
+
+## Data Ethics: Data visualization principles
+
+I'm hoping that the topic for this week is a review for all of you, but it's good to remind ourselves of these principles.  
+
+**Task:**
+
+Read both short articles in Week6. Data visualization section of [Calling Bulllshit](https://www.callingbullshit.org/syllabus.html#Visual). Were there any principles mentioned that you hadn't heard of before? What graph stood out for you as "the worst"? Did any of the graphs fool you? Or were able to overcome the bad practices (don't worry if they fool you - plently of them have fooled me, too.)? How does practicing good data visualization principles fit in with data ethics?
+
+> I've heard of most of the principles. Though "when line graphs ought not include zero" was not talked about very frequently, I often filtered data before plotting and thus avoided such problems in another way. The thyroid cancer incident graph stood out as the worst to me: not only does it include too much information, making it hard to understand, but also it intentionally manipulates both y-axes to trick people to misinterpret the data. I was fooled by the most read books graph. I did not notice most of the bars are below the x-axis and was distracted by the aesthetic. I think it is important to keep in mind that presenting information correctly is more important than making it visually appealing. All of these good data visualization principles are trying to make sure graphs are made correct and present correct information, following good data ethics.
